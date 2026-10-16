@@ -1,0 +1,203 @@
+name: auto-release
+
+# Checks Discord for a new stable version every day. When one is found, it bumps
+# build.properties / res/pinned_update.json / CHANGELOG.md, pushes the commit to
+# the default branch, builds the portable app and publishes a GitHub release.
+
+concurrency:
+  group: ${{ github.workflow }}
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+
+on:
+  workflow_dispatch:
+    inputs:
+      force:
+        description: 'Build and release the current version even if its tag already exists'
+        type: boolean
+        default: false
+  schedule:
+    - cron: '0 6 * * *'
+
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      contents: write # required to push the update commit
+    outputs:
+      release: ${{ steps.tag.outputs.release }}
+      tag: ${{ steps.tag.outputs.tag }}
+      sha: ${{ steps.push.outputs.sha }}
+      version: ${{ steps.update.outputs.version }}
+    steps:
+      -
+        name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 0
+          persist-credentials: true # zizmor: ignore[artipacked] required to push the update commit
+      -
+        name: Update Discord
+        id: update
+        uses: actions/github-script@3a2844b7e9c422d3c10d287c895573f7108da1b3 # v9.0.0
+        with:
+          script: |
+            const fs = require('fs');
+            const path = require('path');
+
+            const sourceUrl = 'https://discord.com/api/updates/distributions/app/manifests/latest?channel=stable&platform=win&arch=x64';
+
+            const file = (p) => path.join(process.env.GITHUB_WORKSPACE, p);
+            const read = (p) => fs.readFileSync(file(p), 'utf8');
+            const write = (p, c) => fs.writeFileSync(file(p), c, 'utf8');
+
+            function propertyValue(content, name) {
+              const match = content.match(new RegExp(`^${name.replaceAll('.', '\\.')}\\s*=\\s*(.+)$`, 'm'));
+              if (!match) {
+                throw new Error(`Missing ${name} in build.properties`);
+              }
+              return match[1].trim();
+            }
+
+            function replaceProperty(content, name, value) {
+              return content.replace(new RegExp(`^(${name.replaceAll('.', '\\.')}\\s*=\\s*).+$`, 'm'), `$1${value}`);
+            }
+
+            function compareVersions(left, right) {
+              const l = left.split('.').map(Number);
+              const r = right.split('.').map(Number);
+              for (let i = 0; i < Math.max(l.length, r.length); i++) {
+                const diff = (l[i] || 0) - (r[i] || 0);
+                if (diff !== 0) {
+                  return diff;
+                }
+              }
+              return 0;
+            }
+
+            const response = await fetch(sourceUrl, {
+              headers: {'accept': 'application/json', 'user-agent': 'discord-portable auto-release'}
+            });
+            if (!response.ok) {
+              throw new Error(`Failed to fetch ${sourceUrl}: ${response.status} ${response.statusText}`);
+            }
+            const manifest = await response.json();
+            const parts = manifest?.full?.host_version;
+            if (!Array.isArray(parts) || parts.length === 0 || !parts.every(Number.isInteger)) {
+              throw new Error(`Invalid Discord host_version: ${JSON.stringify(parts)}`);
+            }
+            const latestVersion = parts.join('.');
+            if (!manifest.full.url.includes(`/${latestVersion}/`)) {
+              throw new Error(`Manifest full.url does not match host_version ${latestVersion}: ${manifest.full.url}`);
+            }
+            core.info(`Latest stable Discord version: ${latestVersion}`);
+
+            const properties = read('build.properties');
+            const currentVersion = propertyValue(properties, 'app.version');
+            const currentRelease = Number(propertyValue(properties, 'app.release'));
+            core.info(`Current version: ${currentVersion}-${currentRelease}`);
+
+            if (compareVersions(latestVersion, currentVersion) <= 0) {
+              if (compareVersions(latestVersion, currentVersion) < 0) {
+                core.warning(`Refusing to downgrade Discord from ${currentVersion} to ${latestVersion}`);
+              }
+              core.setOutput('version', currentVersion);
+              core.setOutput('release', String(currentRelease));
+              return;
+            }
+
+            const nextRelease = currentRelease + 1;
+            let updated = replaceProperty(properties, 'app.version', latestVersion);
+            updated = replaceProperty(updated, 'app.release', String(nextRelease));
+            write('build.properties', updated);
+            write('res/pinned_update.json', `${JSON.stringify(manifest, null, 2)}\n`);
+
+            const date = new Date().toISOString().slice(0, 10).replaceAll('-', '/');
+            const changelog = read('CHANGELOG.md');
+            write('CHANGELOG.md', changelog.replace(
+              /^# Changelog\r?\n\r?\n/,
+              `# Changelog\n\n## ${latestVersion}-${nextRelease} (${date})\n\n* Discord ${latestVersion}\n\n`
+            ));
+
+            core.info(`Updated to ${latestVersion}-${nextRelease}`);
+            core.setOutput('version', latestVersion);
+            core.setOutput('release', String(nextRelease));
+            core.setOutput('title', `Discord ${latestVersion}`);
+      -
+        name: Commit and push
+        id: push
+        env:
+          TITLE: ${{ steps.update.outputs.title }}
+          BRANCH: ${{ github.ref_name }}
+        run: |
+          if [ -n "$(git status --porcelain -- build.properties res/pinned_update.json CHANGELOG.md)" ]; then
+            git config user.name "github-actions[bot]"
+            git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+            git add build.properties res/pinned_update.json CHANGELOG.md
+            git commit -m "$TITLE"
+            git push origin "HEAD:$BRANCH"
+          else
+            echo "Nothing to commit."
+          fi
+          echo "sha=$(git rev-parse HEAD)" >> "$GITHUB_OUTPUT"
+      -
+        name: Check release tag
+        id: tag
+        env:
+          TAG: ${{ steps.update.outputs.version }}-${{ steps.update.outputs.release }}
+          FORCE: ${{ inputs.force }}
+        run: |
+          echo "tag=$TAG" >> "$GITHUB_OUTPUT"
+          if [ "$FORCE" = "true" ] || [ -z "$(git ls-remote --tags origin "refs/tags/$TAG")" ]; then
+            echo "Release $TAG will be built."
+            echo "release=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "Release $TAG already exists, nothing to do."
+            echo "release=false" >> "$GITHUB_OUTPUT"
+          fi
+
+  build:
+    needs: check
+    if: needs.check.outputs.release == 'true'
+    uses: portapps/.github/.github/workflows/app-build.yml@e5160763f75f635b71a10d8162c004e7f88a1a87 # v1.4.1
+    permissions:
+      contents: read
+    with:
+      checkout_ref: ${{ needs.check.outputs.sha }}
+
+  release:
+    needs:
+      - check
+      - build
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      contents: write # required to create the GitHub release
+    steps:
+      -
+        name: Download assets
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          name: ${{ github.event.repository.name }}
+          path: ./bin/release
+      -
+        name: List artifacts
+        run: |
+          ls -lh ./bin/release
+      -
+        name: GitHub Release
+        uses: softprops/action-gh-release@efb35369e0ad2afab669f228072c1b0d510eae64 # v3.0.3
+        with:
+          tag_name: ${{ needs.check.outputs.tag }}
+          target_commitish: ${{ needs.check.outputs.sha }}
+          name: ${{ needs.check.outputs.tag }}
+          make_latest: true
+          body: |
+            * Discord ${{ needs.check.outputs.version }}
+
+            Download `discord-portable-win64-${{ needs.check.outputs.tag }}-setup.exe` (installer) or `discord-portable-win64-${{ needs.check.outputs.tag }}.7z` (portable archive).
+          files: |
+            bin/release/*

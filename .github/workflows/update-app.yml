@@ -22,7 +22,7 @@ on:
 
 jobs:
   update:
-    if: github.event_name != 'pull_request'
+    if: github.event_name != 'pull_request' && github.repository == 'portapps/discord-portable'
     runs-on: windows-latest
     environment: update-app # secrets are gated by this environment
     timeout-minutes: 10
